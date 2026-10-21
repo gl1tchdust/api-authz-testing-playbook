@@ -1,0 +1,4 @@
+# The probe needs an HTTP client and a YAML parser. Nothing else.
+requests>=2.31
+PyYAML>=6.0
+pytest>=8.0

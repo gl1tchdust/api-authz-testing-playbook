@@ -1,0 +1,33 @@
+# The target is fetched, never vendored
+.target/
+
+# Probe output that CI regenerates. captures/ IS committed: the case
+# write-ups quote it, so it is the evidence, not a build artifact.
+findings.json
+probe-output.txt
+target.log
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Secrets - never commit these
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+secrets.*
+credentials.*
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+.hypothesis/

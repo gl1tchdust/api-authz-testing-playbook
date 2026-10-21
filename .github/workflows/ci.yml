@@ -1,0 +1,206 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly. The target is pinned, so this catches rot in our own code and in
+    # the Python packaging it depends on, not upstream changes.
+    - cron: "23 5 * * 2"
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The probe's own logic. No target needed, so this is fast and runs first.
+  # ---------------------------------------------------------------------------
+  unit:
+    name: unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet -r requirements.txt
+      - name: Tests that need no target
+        run: python -m pytest authzprobe/ -q
+
+  # ---------------------------------------------------------------------------
+  # Do the documented cases still reproduce?
+  #
+  # Every request and response in cases/ was captured from a live run. If a
+  # case stops reproducing, the write-up is wrong and the build should say so.
+  # ---------------------------------------------------------------------------
+  reproduce:
+    name: cases reproduce against VAmPI
+    needs: unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet -r requirements.txt
+
+      - name: Fetch the pinned target
+        run: ./scripts/vampi.sh fetch
+
+      - name: Start it
+        run: |
+          ./scripts/vampi.sh run > target.log 2>&1 &
+          ./scripts/vampi.sh wait
+
+      - name: Live reproduction tests
+        env:
+          AUTHZPROBE_TARGET: http://127.0.0.1:5000
+        run: python -m pytest authzprobe/ -q
+
+      - name: Run the probe and capture exchanges
+        run: |
+          set +e
+          python -m authzprobe.probe \
+            --cases authzprobe/cases.yml \
+            --capture captures \
+            --json-out findings.json | tee probe-output.txt
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "probe exit code: $rc"
+
+          # The target is deliberately vulnerable, so the probe is EXPECTED to
+          # find violations. Exit 0 means it stopped detecting them, which is
+          # a broken probe, not a fixed target.
+          if [ "$rc" -eq 2 ]; then
+            echo "::error::probe could not complete, see output above"
+            exit 1
+          fi
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::probe found no violations in a deliberately vulnerable API. The probe is broken."
+            exit 1
+          fi
+
+      - name: Check the captures are not stale
+        run: python scripts/check_captures.py captures authzprobe/cases.yml findings.json
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Case reproduction"
+            echo
+            echo 'The target is deliberately vulnerable. Violations are the expected'
+            echo 'outcome; this job is green because every documented case still'
+            echo 'reproduces against the pinned build.'
+            echo
+            echo '```'
+            cat probe-output.txt 2>/dev/null || echo "(no probe output)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Target log on failure
+        if: failure()
+        run: tail -50 target.log || true
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: captures
+          path: |
+            captures/
+            findings.json
+            probe-output.txt
+
+  # ---------------------------------------------------------------------------
+  # Negative control.
+  #
+  # "The probe found 8 violations" is unfalsifiable on its own. A tool that
+  # reports findings against every target it sees is indistinguishable from
+  # one that works, right up until it matters.
+  #
+  # VAmPI gates three of its five authorization flaws behind `vulnerable=0`,
+  # so running the same cases against both builds is a free control: three
+  # cases must go quiet and two must not. Both directions are failures.
+  # ---------------------------------------------------------------------------
+  negative-control:
+    name: negative control (vulnerable vs fixed)
+    needs: unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet -r requirements.txt
+      - run: ./scripts/vampi.sh fetch
+
+      - name: Probe the vulnerable build
+        run: |
+          VULNERABLE=1 ./scripts/vampi.sh run > vuln.log 2>&1 &
+          echo $! > vuln.pid
+          ./scripts/vampi.sh wait
+          python -m authzprobe.probe --cases authzprobe/cases.yml \
+            --json-out vuln.json || true
+          kill "$(cat vuln.pid)" 2>/dev/null || true
+          # Wait for the port to clear before starting the second build.
+          for _ in $(seq 1 20); do
+            curl -sf http://127.0.0.1:5000/ >/dev/null 2>&1 || break
+            sleep 1
+          done
+
+      - name: Probe the fixed build
+        run: |
+          VULNERABLE=0 ./scripts/vampi.sh run > secure.log 2>&1 &
+          echo $! > secure.pid
+          ./scripts/vampi.sh wait
+          python -m authzprobe.probe --cases authzprobe/cases.yml \
+            --json-out secure.json || true
+          kill "$(cat secure.pid)" 2>/dev/null || true
+
+      - name: Compare
+        run: |
+          python scripts/negative_control.py vuln.json secure.json \
+            authzprobe/cases.yml | tee control.txt
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Negative control"
+            echo
+            echo 'Same cases, same probe, run against VAmPI with its flaws enabled and'
+            echo 'disabled. The output must track the three `if vuln:` guards in the'
+            echo 'source exactly.'
+            echo
+            echo '```'
+            cat control.txt 2>/dev/null || echo "(no output)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: negative-control
+          path: |
+            vuln.json
+            secure.json
+            control.txt
+
+  # ---------------------------------------------------------------------------
+  # Secrets, across the whole history.
+  # ---------------------------------------------------------------------------
+  gitleaks:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks
+        run: |
+          curl -sSfL -o /tmp/gitleaks.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo install /tmp/gitleaks /usr/local/bin/gitleaks
+      - run: gitleaks detect --redact --verbose

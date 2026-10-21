@@ -1,0 +1,191 @@
+# Property names worth trying in a mass-assignment probe.
+#
+# Ordered by what they change, not alphabetically. Names that flip an
+# authorization decision come first, because those are the ones that turn a
+# shrug into a finding.
+#
+# How to use this:
+#
+#   One name per request. Adding several at once makes it unclear which was
+#   accepted, and some frameworks reject an entire body on a single unknown
+#   property, which reads as "not vulnerable" when it is not.
+#
+#   Try each in camelCase, snake_case and PascalCase. Only the convention the
+#   server's model actually uses will bind. Both spellings of the common ones
+#   are listed; derive the rest.
+#
+#   Always read the object back. A 2xx on the write proves nothing.
+#   See cases/API3-MA-01 for why.
+#
+# This list is deliberately short. A 10,000-entry list of every field name in
+# existence costs more requests than it is worth; these are the ones that
+# carry privilege.
+
+# --- role and privilege: highest value, test these first --------------------
+admin
+is_admin
+isAdmin
+isSuperuser
+is_superuser
+superuser
+is_staff
+isStaff
+role
+roles
+role_id
+roleId
+user_role
+userRole
+permissions
+permission
+scopes
+scope
+authorities
+groups
+group
+group_id
+privilege
+privileges
+access_level
+accessLevel
+user_type
+userType
+account_type
+accountType
+is_moderator
+isModerator
+
+# --- account state: often gates login or a workflow -------------------------
+active
+is_active
+isActive
+enabled
+is_enabled
+disabled
+locked
+is_locked
+verified
+is_verified
+isVerified
+email_verified
+emailVerified
+confirmed
+is_confirmed
+approved
+is_approved
+status
+state
+deleted
+is_deleted
+deleted_at
+deletedAt
+
+# --- ownership and tenancy: reassign an object to yourself ------------------
+user_id
+userId
+owner
+owner_id
+ownerId
+created_by
+createdBy
+account_id
+accountId
+tenant_id
+tenantId
+org_id
+orgId
+organization_id
+organizationId
+company_id
+companyId
+team_id
+teamId
+customer_id
+customerId
+workspace_id
+workspaceId
+parent_id
+parentId
+
+# --- money and quantity: the ones that pay -----------------------------------
+balance
+credit
+credits
+amount
+total
+total_amount
+totalAmount
+price
+unit_price
+unitPrice
+cost
+discount
+discount_percent
+discountPercent
+quantity
+qty
+currency
+limit
+credit_limit
+creditLimit
+overdraft
+fee
+tax
+points
+tier
+plan
+plan_id
+planId
+subscription
+subscription_id
+subscriptionId
+trial_ends_at
+trialEndsAt
+expires_at
+expiresAt
+
+# --- identity and recovery: account takeover primitives ----------------------
+email
+email_address
+emailAddress
+username
+password
+password_hash
+passwordHash
+phone
+phone_number
+phoneNumber
+mfa_enabled
+mfaEnabled
+two_factor_enabled
+twoFactorEnabled
+reset_token
+resetToken
+verification_token
+verificationToken
+api_key
+apiKey
+api_token
+apiToken
+secret
+client_secret
+clientSecret
+
+# --- server-controlled metadata: integrity and audit evasion -----------------
+id
+_id
+uuid
+created_at
+createdAt
+updated_at
+updatedAt
+version
+revision
+signature
+checksum
+internal_notes
+internalNotes
+audit_log
+auditLog
+ip_address
+ipAddress
