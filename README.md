@@ -301,6 +301,64 @@ Note the deliberate split between 1 and 2. A probe that cannot log in must not
 report "no violations found", for the same reason an unparseable scan report
 must never be read as a clean one.
 
+## Reading the model a spec declares
+
+An OpenAPI document already contains a permission model. `security` on each
+operation says whether a credential is required, and OAuth2 schemes name the
+scopes. That model is worth printing, because one spread across forty
+operation objects is one nobody has read end to end.
+
+```bash
+python -m authzprobe.openapi .target/vampi/openapi_specs/openapi3.yml
+python -m authzprobe.openapi spec.yml --held-scopes orders:read   # what must be refused
+python -m authzprobe.openapi spec.yml --emit-cases                # case stubs
+```
+
+With `--held-scopes`, the document defines its own conformance test: an
+operation requiring `orders:write` must refuse a token carrying only
+`orders:read`. A 2xx there means the API does not enforce the model it
+publishes.
+
+### What a spec cannot declare, and why that is the useful part
+
+Against VAmPI, conformance testing finds **nothing**. Its spec declares six
+operations as requiring a credential, and all six were verified by hand to
+return 401 to an unauthenticated caller. The implementation matches the
+document.
+
+Its real authorization flaws are invisible to conformance for two separate
+reasons:
+
+| Case | Why conformance misses it |
+|---|---|
+| `GET /users/v1/_debug` dumps every password | the spec declares it **public**, so spec and code agree |
+| `PUT /users/v1/{username}/password` lets anyone change anyone's | `security: [{bearerAuth: []}]` means "a credential is required", which is satisfied |
+
+The second is the structural one. **OpenAPI has no vocabulary for "only the
+owner of `{username}` may call this."** Object-level authorization cannot be
+expressed, so it cannot be checked, which is exactly why BOLA stays the
+top-ranked API risk while schema validation is a solved problem.
+
+So this module does not issue verdicts on those. It produces the shortlist:
+authenticated operations that address one object by path.
+
+On VAmPI that is four operations, and testing all four by hand gave:
+
+- `GET /books/v1/{book_title}` and `PUT /users/v1/{username}/password` are the
+  two documented findings in this playbook, recovered from the spec alone.
+- `DELETE /users/v1/{username}` is correctly gated: `401 Only Admins may
+  delete users!`. A negative result, which is what a shortlist is for.
+- `PUT /users/v1/{username}/email` returns **204** to a cross-user write and
+  is **not** a finding. It updates the caller's own record. That is precisely
+  the false positive `_effect_confirmed` exists to suppress, arrived at from a
+  different direction.
+
+Which is the honest summary: the spec picks the targets, a human decides who
+should be allowed to reach them, and the probe checks whether the write landed
+on the victim. `--emit-cases` leaves `authorized: []` unset on purpose,
+because a generated file that guessed would look like coverage while asserting
+whatever the generator assumed.
+
 ## What this does not do
 
 - **No authorization testing of flows.** It compares single requests. A
@@ -316,8 +374,8 @@ must never be read as a clean one.
 ## Tests
 
 ```bash
-python -m pytest authzprobe/ -q                              # 69, no target needed
-AUTHZPROBE_TARGET=http://127.0.0.1:5000 python -m pytest -q  # 74, with a live target
+python -m pytest authzprobe/ -q                              # 102, no target needed
+AUTHZPROBE_TARGET=http://127.0.0.1:5000 python -m pytest -q  # 107, with a live target
 ```
 
 The unit tests concentrate on the violation decision, because a probe that
@@ -334,6 +392,7 @@ pinned commit, and that the target is in fact that commit. CI runs both.
 cases/                  the playbook, one file per test case
 authzprobe/probe.py     differential authorization probe
 authzprobe/cases.yml    machine-readable case definitions, read by both
+authzprobe/openapi.py   reads the authorization model a spec declares
 authzprobe/test_*.py    unit tests, plus live reproduction tests
 captures/               verbatim exchanges, generated
 wordlists/              property names for mass-assignment probing
