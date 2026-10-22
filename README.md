@@ -215,9 +215,79 @@ snake_case and PascalCase, and read the object back every time.
 
 ```bash
 cp authzprobe/cases.yml my-api.yml
-# edit target.base_url, target.login, identities, and the cases
+# edit target.base_url, target.auth, identities, and the cases
 python -m authzprobe.probe --cases my-api.yml --base-url https://staging.example.com
 ```
+
+### Getting a credential for each identity
+
+The whole differential depends on holding several principals at once, so the
+probe has to be able to obtain a credential the way your API actually issues
+one. `target.auth.mode` selects how.
+
+**`form`**, the default, and what the VAmPI case file uses. POST a JSON body
+to a login path and read a token out of the response. Common in teaching
+targets and internal APIs, rare in production.
+
+```yaml
+target:
+  auth:
+    mode: form
+    method: POST
+    path: /users/v1/login
+    body: { username: "$username", password: "$password" }
+    token_field: auth_token
+identities:
+  - { id: owner, username: name1, password: pass1 }
+```
+
+**`oauth2_client_credentials`** ([RFC 6749 §4.4](https://www.rfc-editor.org/rfc/rfc6749#section-4.4))
+and **`oauth2_password`** ([§4.3](https://www.rfc-editor.org/rfc/rfc6749#section-4.3)).
+`token_url` may be absolute, because the authorization server usually is not
+the API under test. `credentials` places the client id and secret in the body
+or in HTTP Basic, which [§2.3.1](https://www.rfc-editor.org/rfc/rfc6749#section-2.3.1)
+permits either way and servers disagree about.
+
+```yaml
+target:
+  auth:
+    mode: oauth2_client_credentials
+    token_url: https://auth.example.com/oauth2/token
+    credentials: basic          # or body, the default
+    token_field: access_token   # the default
+identities:
+  - { id: owner,  client_id: svc-a, client_secret: ${A}, scope: "orders:write" }
+  - { id: other,  client_id: svc-b, client_secret: ${B}, scope: "orders:write" }
+  - { id: reader, client_id: svc-c, client_secret: ${C}, scope: "orders:read" }
+  - { id: anon }
+```
+
+**A credential you already hold** needs no mode. Give the identity a `token`
+and acquisition is skipped, which covers static bearers and API keys. Change
+`header_name` and `header_value` for a key that does not go in
+`Authorization`:
+
+```yaml
+target:
+  auth:
+    header_name: X-API-Key
+    header_value: "{token}"
+identities:
+  - { id: owner, token: ${OWNER_KEY} }
+  - { id: other, token: ${OTHER_KEY} }
+  - { id: anon }
+```
+
+Two deliberate behaviours. A token request that fails **stops the run** with
+exit 2 rather than continuing with a tokenless identity, because an identity
+that silently sends no credential turns the owner arm into a second anonymous
+arm and the differential then reports nothing however broken the target is.
+And a 200 carrying an empty token is treated as a failure for the same reason.
+
+Secrets belong in the environment, not the case file. Nothing about token
+acquisition is written to captures: the token endpoint is not routed through
+the method that records evidence, precisely because its request body carries a
+client secret.
 
 Exit codes make it usable as a CI gate against your own staging environment:
 
@@ -246,8 +316,8 @@ must never be read as a clean one.
 ## Tests
 
 ```bash
-python -m pytest authzprobe/ -q                              # 32, no target needed
-AUTHZPROBE_TARGET=http://127.0.0.1:5000 python -m pytest -q  # 37, with a live target
+python -m pytest authzprobe/ -q                              # 69, no target needed
+AUTHZPROBE_TARGET=http://127.0.0.1:5000 python -m pytest -q  # 74, with a live target
 ```
 
 The unit tests concentrate on the violation decision, because a probe that

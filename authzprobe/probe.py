@@ -28,6 +28,7 @@ import argparse
 import dataclasses
 import datetime as dt
 import json
+import os
 import pathlib
 import re
 import sys
@@ -36,6 +37,17 @@ import requests
 import yaml
 
 TIMEOUT = 15
+
+# How the probe gets a credential for each identity.
+#
+#   form   POST a JSON body to a login path and read a token out of the
+#          response. What VAmPI and most teaching targets do.
+#   oauth2_password            RFC 6749 section 4.3
+#   oauth2_client_credentials  RFC 6749 section 4.4
+#
+# An identity that carries `token` directly needs none of these, which covers
+# static bearer tokens and API keys without a mode of its own.
+AUTH_MODES = frozenset({"form", "oauth2_password", "oauth2_client_credentials"})
 
 
 class ProbeError(Exception):
@@ -47,11 +59,25 @@ class Identity:
     id: str
     username: str | None = None
     password: str | None = None
+    # Supplied directly for a target that hands out long-lived tokens or API
+    # keys. An identity that already has one skips acquisition entirely.
     token: str | None = None
+    # OAuth2 client credentials, for the two grants in RFC 6749 this supports.
+    client_id: str | None = None
+    client_secret: str | None = None
+    scope: str | None = None
 
     @property
     def anonymous(self) -> bool:
-        return self.username is None
+        """No credential of any kind, so the probe sends the request bare.
+
+        This used to be `username is None`, which was right while form login
+        was the only way in. It silently misclassifies every token-based
+        identity: a client-credentials principal has no username, so it was
+        treated as the anonymous arm and the whole differential collapsed into
+        comparing anonymous against anonymous.
+        """
+        return not (self.username or self.token or self.client_id)
 
 
 @dataclasses.dataclass
@@ -90,6 +116,29 @@ class Exchange:
 _JWT = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")
 
 
+def _expand_env(value, identity_id: str, field: str):
+    """Expand `$VAR` and `${VAR}` in an identity field.
+
+    A case file is committed to a repository; a client secret is not. Reading
+    credentials from the environment is the only arrangement where those two
+    facts coexist.
+
+    `expandvars` leaves an undefined name untouched, which would send the
+    literal string `${CLIENT_SECRET}` as the secret and fail at the token
+    endpoint as an ordinary 401. That is a confusing way to learn you forgot an
+    export, so an unexpanded placeholder is an error here instead.
+    """
+    if not isinstance(value, str):
+        return value
+    expanded = os.path.expandvars(value)
+    if "$" in expanded and re.search(r"\$\{?\w+\}?", expanded):
+        raise ProbeError(
+            f"identity {identity_id!r} field {field!r} references an unset "
+            f"environment variable: {value!r}"
+        )
+    return expanded
+
+
 def redact_tokens(body: str, extra_fields: tuple[str, ...] = ()) -> str:
     """Strip credential material out of a response body before it is written.
 
@@ -123,9 +172,21 @@ class Probe:
         self.base = (base_url or self.target.get("base_url") or "").rstrip("/")
         if not self.base:
             raise ProbeError("no base_url in the case file and none passed on the command line")
-        self.login_cfg = self.target.get("login") or {}
+        # `auth` is the current spelling; `login` is the original one and still
+        # works, because the VAmPI case file and its captures are written
+        # against it. An unrecognised mode is rejected at load time rather than
+        # part-way through a run.
+        self.login_cfg = self.target.get("auth") or self.target.get("login") or {}
+        self.auth_mode = self.login_cfg.get("mode", "form")
+        if self.auth_mode not in AUTH_MODES:
+            raise ProbeError(
+                f"unknown auth mode {self.auth_mode!r}, expected one of "
+                f"{', '.join(sorted(AUTH_MODES))}"
+            )
         self.identities = {
-            i["id"]: Identity(**i) for i in (spec.get("identities") or [])
+            i["id"]: Identity(**{k: _expand_env(v, i.get("id", "?"), k)
+                                 for k, v in i.items()})
+            for i in (spec.get("identities") or [])
         }
         self.variables_spec = spec.get("variables") or {}
         self.cases = spec.get("cases") or []
@@ -189,26 +250,102 @@ class Probe:
         for step in self.target.get("seed") or []:
             self._send(step["method"], step["path"], step.get("body"))
 
+    def _acquire_form(self, identity: Identity) -> str:
+        """POST a JSON login body and read the token out of the response."""
+        body = {
+            k: str(v).replace("$username", identity.username or "")
+                       .replace("$password", identity.password or "")
+            for k, v in (self.login_cfg.get("body") or {}).items()
+        }
+        ex = self._send(self.login_cfg["method"], self.login_cfg["path"], body)
+        if ex.status != 200:
+            raise ProbeError(
+                f"login failed for {identity.id!r}: HTTP {ex.status} {ex.response_body[:160]}"
+            )
+        try:
+            return json.loads(ex.response_body)[self.login_cfg["token_field"]]
+        except (json.JSONDecodeError, KeyError) as exc:
+            raise ProbeError(f"no token for {identity.id!r} in login response") from exc
+
+    def _acquire_oauth2(self, identity: Identity, mode: str) -> str:
+        """Run an OAuth2 token request for one identity.
+
+        Deliberately not routed through `_send`. The token endpoint is
+        form-encoded rather than JSON, frequently lives on a different host to
+        the API under test, and the request body carries a client secret. None
+        of that belongs in the method that records evidence.
+        """
+        token_url = self.login_cfg.get("token_url") or self.login_cfg.get("path")
+        if not token_url:
+            raise ProbeError("auth mode is oauth2 but no token_url is configured")
+        if not token_url.startswith(("http://", "https://")):
+            token_url = self.base + token_url
+
+        if mode == "oauth2_client_credentials":
+            data = {"grant_type": "client_credentials"}
+            if not identity.client_id:
+                raise ProbeError(f"{identity.id!r} has no client_id for client_credentials")
+        else:
+            data = {"grant_type": "password",
+                    "username": identity.username or "",
+                    "password": identity.password or ""}
+            if not identity.username:
+                raise ProbeError(f"{identity.id!r} has no username for the password grant")
+        if identity.scope:
+            data["scope"] = identity.scope
+
+        # RFC 6749 section 2.3.1 permits either HTTP Basic or the request body
+        # for client credentials, and servers differ on which they accept.
+        auth = None
+        placement = self.login_cfg.get("credentials", "body")
+        if identity.client_id:
+            if placement == "basic":
+                auth = (identity.client_id, identity.client_secret or "")
+            elif placement == "body":
+                data["client_id"] = identity.client_id
+                if identity.client_secret:
+                    data["client_secret"] = identity.client_secret
+            else:
+                raise ProbeError(
+                    f"credentials must be 'body' or 'basic', not {placement!r}"
+                )
+
+        try:
+            resp = requests.post(token_url, data=data, auth=auth, timeout=TIMEOUT)
+        except requests.RequestException as exc:
+            raise ProbeError(f"token request to {token_url} failed: {exc}") from exc
+
+        if resp.status_code != 200:
+            # The body of a failed token response is an RFC 6749 error object,
+            # not a credential, so it is safe and useful to surface.
+            raise ProbeError(
+                f"token request for {identity.id!r} returned HTTP "
+                f"{resp.status_code}: {resp.text[:160]}"
+            )
+        field = self.login_cfg.get("token_field", "access_token")
+        try:
+            token = resp.json()[field]
+        except (ValueError, KeyError) as exc:
+            raise ProbeError(
+                f"no {field!r} in the token response for {identity.id!r}"
+            ) from exc
+        if not token:
+            raise ProbeError(f"empty {field!r} in the token response for {identity.id!r}")
+        return token
+
     def authenticate(self) -> None:
         if not self.login_cfg:
             return
         for identity in self.identities.values():
-            if identity.anonymous:
+            if identity.anonymous or identity.token:
+                # Nothing to acquire: no credential at all, or one was supplied
+                # in the case file, which is how a static bearer or API key
+                # identity works.
                 continue
-            body = {
-                k: str(v).replace("$username", identity.username or "")
-                           .replace("$password", identity.password or "")
-                for k, v in (self.login_cfg.get("body") or {}).items()
-            }
-            ex = self._send(self.login_cfg["method"], self.login_cfg["path"], body)
-            if ex.status != 200:
-                raise ProbeError(
-                    f"login failed for {identity.id!r}: HTTP {ex.status} {ex.response_body[:160]}"
-                )
-            try:
-                identity.token = json.loads(ex.response_body)[self.login_cfg["token_field"]]
-            except (json.JSONDecodeError, KeyError) as exc:
-                raise ProbeError(f"no token for {identity.id!r} in login response") from exc
+            if self.auth_mode == "form":
+                identity.token = self._acquire_form(identity)
+            else:
+                identity.token = self._acquire_oauth2(identity, self.auth_mode)
 
     def discover(self) -> None:
         for name, spec in self.variables_spec.items():
