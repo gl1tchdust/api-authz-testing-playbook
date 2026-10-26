@@ -339,10 +339,33 @@ owner of `{username}` may call this."** Object-level authorization cannot be
 expressed, so it cannot be checked, which is exactly why BOLA stays the
 top-ranked API risk while schema validation is a solved problem.
 
-So this module does not issue verdicts on those. It produces the shortlist:
-authenticated operations that address one object by path.
+So this module does not issue verdicts on those. It produces two shortlists,
+both of operations that address one object by path.
 
-On VAmPI that is four operations, and testing all four by hand gave:
+**Authenticated**, where the ownership check is the thing that can be broken.
+
+**Public**, where there is no ownership check at all and the identifier *is*
+the access control. These were originally folded into the public list and
+ignored, on the reasoning that a document declaring an endpoint public agrees
+with an implementation that leaves it public, so there is no contradiction to
+report. True, and the wrong conclusion. A public operation taking an object id
+is a weaker position than an authenticated one with a broken check, not a
+stronger one, and the whole protection is whether the id can be guessed,
+enumerated or read from somewhere it leaked.
+
+The case that made that obvious came from pointing this at a self-hosted
+payment gateway that publishes
+
+```
+POST /api/v1/checkout/{id}/cancel
+```
+
+with no security scheme anywhere in its document. Correctly declared, fully
+conformant, and the only thing stopping a stranger cancelling someone's
+checkout is not knowing the id.
+
+On VAmPI the authenticated list is four operations, and testing all four by
+hand gave:
 
 - `GET /books/v1/{book_title}` and `PUT /users/v1/{username}/password` are the
   two documented findings in this playbook, recovered from the spec alone.
@@ -352,6 +375,13 @@ On VAmPI that is four operations, and testing all four by hand gave:
   is **not** a finding. It updates the caller's own record. That is precisely
   the false positive `_effect_confirmed` exists to suppress, arrived at from a
   different direction.
+
+The public list holds one: `GET /users/v1/{username}`, whose identifier is a
+username. That is about as guessable as an identifier gets, so "protected only
+by an unguessable identifier" here means protected by nothing. It is
+**API1-BOLA-03** in this playbook, and an earlier version of this module
+dropped it on purpose with the reasoning above. All three documented
+object-level findings now come out of the specification alone.
 
 Which is the honest summary: the spec picks the targets, a human decides who
 should be allowed to reach them, and the probe checks whether the write landed

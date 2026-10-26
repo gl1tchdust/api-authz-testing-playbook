@@ -16,6 +16,7 @@ import yaml
 from authzprobe.openapi import (
     Operation,
     bola_candidates,
+    identifier_only_candidates,
     declared_scopes,
     emit_cases,
     load,
@@ -199,14 +200,47 @@ def test_an_authenticated_operation_with_an_identifier_is_a_candidate():
     assert ops[0].identifier_params == ["username"]
 
 
-def test_a_public_operation_with_an_identifier_is_not_a_candidate():
-    """The probe's BOLA-03 lives here: VAmPI's spec declares
-    GET /users/v1/{username} public, so the specification agrees with the
-    implementation and conformance has nothing to say. That case has to be
-    written by hand, which is why this module emits stubs rather than verdicts.
+def test_a_public_operation_with_an_identifier_is_not_a_bola_candidate():
+    """It belongs to the other shortlist, not to neither.
+
+    This test used to carry the reasoning that a public operation taking an
+    object id has no contradiction to report, so there was nothing to say
+    about it. That is true and was the wrong conclusion: when an operation is
+    public, the identifier is the entire access control, which is a weaker
+    position than an authenticated endpoint with a broken ownership check.
+    `identifier_only_candidates` now reports them separately.
     """
     ops = [Operation("get", "/users/{username}", None, [], False)]
     assert bola_candidates(ops) == []
+    assert [str(o) for o in identifier_only_candidates(ops)] == ["GET /users/{username}"]
+
+
+def test_the_two_shortlists_do_not_overlap():
+    ops = [
+        Operation("get", "/public/{id}", None, [], False),
+        Operation("get", "/private/{id}", None, [{"bearerAuth": []}], False),
+        Operation("get", "/nothing", None, [{"bearerAuth": []}], False),
+    ]
+    bola = {str(o) for o in bola_candidates(ops)}
+    id_only = {str(o) for o in identifier_only_candidates(ops)}
+    assert bola == {"GET /private/{id}"}
+    assert id_only == {"GET /public/{id}"}
+    assert not (bola & id_only)
+
+
+def test_a_public_operation_without_an_identifier_is_in_neither_list():
+    ops = [Operation("post", "/login", None, [], False)]
+    assert bola_candidates(ops) == []
+    assert identifier_only_candidates(ops) == []
+
+
+def test_stubs_are_emitted_for_public_identifier_operations_too():
+    """They need hand-written cases at least as much as the authenticated ones."""
+    ops = [Operation("post", "/checkout/{id}/cancel", "cancelCheckout", [], False)]
+    parsed = yaml.safe_load(emit_cases(ops))
+    assert len(parsed["cases"]) == 1
+    assert parsed["cases"][0]["request"]["path"] == "/checkout/{id}/cancel"
+    assert parsed["cases"][0]["authorized"] == []
 
 
 def test_an_authenticated_operation_with_no_path_parameter_is_not_a_candidate():
@@ -250,7 +284,7 @@ def test_no_candidates_emits_a_comment_not_an_empty_cases_key():
     nothing, which is worse than a file that says so."""
     text = emit_cases([])
     assert yaml.safe_load(text) is None
-    assert "No authenticated operations" in text
+    assert "No operation addresses an object by path" in text
 
 
 def test_render_names_what_the_document_cannot_express():
@@ -301,9 +335,17 @@ def test_vampi_spec_yields_the_documented_authorization_model():
         "PUT /users/v1/{username}/password",
     }
 
-    # Recovers both documented object-level findings.
+    # Recovers both authenticated object-level findings.
     assert "GET /books/v1/{book_title}" in candidates
     assert "PUT /users/v1/{username}/password" in candidates
+
+    # And BOLA-03, which the authenticated shortlist cannot hold because the
+    # specification declares that endpoint public. Its id is a username, which
+    # is about as guessable as an identifier gets, so "protected only by an
+    # unguessable identifier" is protected by nothing. All three documented
+    # object-level findings now come out of the specification alone.
+    id_only = {str(o) for o in identifier_only_candidates(ops)}
+    assert id_only == {"GET /users/v1/{username}"}
 
     # VAmPI declares no scopes, so there is nothing to conformance-test.
     assert declared_scopes(doc) == {}
