@@ -4,6 +4,7 @@
 #   ./scripts/vampi.sh fetch     # clone at the pinned commit, build its venv
 #   ./scripts/vampi.sh run       # run in the FOREGROUND, blocks
 #   ./scripts/vampi.sh wait      # block until it answers, then seed
+#   ./scripts/vampi.sh seed      # reseed a running target
 #
 #   VULNERABLE=0 ./scripts/vampi.sh run    # the fixed build, for the control
 #
@@ -85,16 +86,42 @@ cmd_run() {
   exec env vulnerable="$VULNERABLE" tokentimetolive=3600 "$py" app.py
 }
 
+# Seeding is retried, because the target's own seed data collides with itself.
+#
+# VAmPI gives each of its three seed users one book titled
+# "bookTitle<randrange(100)>", and books.book_title is UNIQUE. Three draws
+# from 100 therefore collide about 3% of the time, /createdb answers 500, and
+# the build goes red against code nobody touched. Measured here over 300
+# consecutive seeds: 11 failures, 3.67%, against 2.98% predicted. That is what
+# turned the weekly schedule red on 2026-11-03.
+#
+# Retrying is safe rather than a partial write: /createdb calls drop_all()
+# before it seeds, so attempt two starts from an empty database and re-rolls
+# the titles. Five attempts take this from roughly 1 run in 34 to 1 in 400,000.
+SEED_ATTEMPTS="${SEED_ATTEMPTS:-5}"
+
+cmd_seed() {
+  local attempt
+  for attempt in $(seq 1 "$SEED_ATTEMPTS"); do
+    if curl -sf "$BASE/createdb" >/dev/null 2>&1; then
+      echo "seeded. users: name1/pass1  name2/pass2  admin/pass1"
+      return 0
+    fi
+    echo "seed attempt $attempt failed, most likely a book-title collision; re-rolling" >&2
+  done
+  echo "could not seed after $SEED_ATTEMPTS attempts; this is not the known collision" >&2
+  return 1
+}
+
 cmd_wait() {
   echo -n "waiting for $BASE "
   for _ in $(seq 1 60); do
     if curl -sf "$BASE/" >/dev/null 2>&1; then
       echo "up"
-      # Seed. Book titles are randomised per seed, which is why the probe
-      # discovers them rather than hardcoding.
-      curl -sf "$BASE/createdb" >/dev/null
-      echo "seeded. users: name1/pass1  name2/pass2  admin/pass1"
-      return 0
+      # Book titles are randomised per seed, which is why the probe discovers
+      # them rather than hardcoding.
+      cmd_seed
+      return $?
     fi
     echo -n "."
     sleep 1
@@ -107,5 +134,6 @@ case "${1:-}" in
   fetch) cmd_fetch ;;
   run)   cmd_run ;;
   wait)  cmd_wait ;;
-  *) echo "usage: $0 {fetch|run|wait}" >&2; exit 1 ;;
+  seed)  cmd_seed ;;
+  *) echo "usage: $0 {fetch|run|wait|seed}" >&2; exit 1 ;;
 esac
